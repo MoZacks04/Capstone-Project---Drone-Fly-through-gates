@@ -53,6 +53,7 @@ def main():
         while True:
             frame = frame_reader.frame
             if frame is None:
+                time.sleep(0.01)
                 continue
 
             try:
@@ -75,7 +76,13 @@ def main():
 
             action = "IDLE"
             if AUTO_MODE and is_flying:
-                action = ctrl.update(tello, vp)
+                try:
+                    action = ctrl.update(tello, vp)
+                except Exception as e:
+                    action = f"CTRL_ERROR: {e}"
+                    print(action)
+                    AUTO_MODE = False
+                
 
             cv2.putText(
                 output,
@@ -189,7 +196,7 @@ def main():
                     try:
                         print("Taking off...")
                         tello.takeoff()
-                        time.sleep(2)
+                        time.sleep(4)
                         is_flying = True
                         print("Takeoff successful.")
                     except Exception as e:
