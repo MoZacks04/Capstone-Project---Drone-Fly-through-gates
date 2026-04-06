@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import time
 
 
 class VisionProcessor:
@@ -19,6 +20,7 @@ class VisionProcessor:
         self.marker_size_cm = 10.0
 
         # Placeholder camera matrix / distortion
+        # Replace with real calibration values later
         self.camera_matrix = np.array(
             [
                 [920.0, 0.0, 480.0],
@@ -35,9 +37,12 @@ class VisionProcessor:
         self.detector_params = cv2.aruco.DetectorParameters()
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.detector_params)
 
-        self._reset_public_outputs()
+        # Debug throttling
+        self.last_debug_time = 0.0
+        self.debug_interval_s = 0.5
 
-        print("[ℹ️ INFO] VisionProcessor initialized")
+        self._reset_public_outputs()
+        print("[INFO] VisionProcessor initialized")
 
     def _reset_public_outputs(self):
         self.gate_detected = False
@@ -51,11 +56,23 @@ class VisionProcessor:
         self.corners_seen = []
         self.marker_ids = []
 
+        # Pose errors
+        self.x_err = 0.0
+        self.y_err = 0.0
+        self.z_err = 0.0
+
+    def _debug_print(self, msg):
+        now = time.time()
+        if now - self.last_debug_time >= self.debug_interval_s:
+            print(msg)
+            self.last_debug_time = now
+
     def process_frame(self, frame):
         self._reset_public_outputs()
         output = frame.copy()
 
-        corners, ids, _ = self.detector.detectMarkers(frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self.detector.detectMarkers(gray)
 
         if ids is None or len(ids) == 0:
             cv2.putText(
@@ -84,16 +101,13 @@ class VisionProcessor:
             else:
                 ignored_ids.append(marker_id)
 
-        if ignored_ids:
-            print(f"[WARNING] Ignoring unknown marker IDs: {ignored_ids}")
-
         self._draw_debug_text(output, ids, valid_ids, ignored_ids)
 
         if len(valid_ids) == 0:
             cv2.putText(
                 output,
                 "Only unknown markers detected",
-                (20, 70),
+                (20, 95),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 0, 255),
@@ -101,9 +115,13 @@ class VisionProcessor:
             )
             return output
 
+        # Gate is detected as soon as we see valid gate markers
+        self.gate_detected = True
+        self.gate_name = "GATE_1"
+
         self._draw_marker_centers(output, valid_corners, valid_ids)
 
-        # Publish values for controller
+        # Public outputs for controller
         self.marker_ids = valid_ids[:]
         self.N_corners = len(valid_ids)
         self.corners_seen = [self._id_to_corner_name(mid) for mid in valid_ids]
@@ -115,30 +133,53 @@ class VisionProcessor:
 
         if pose is not None:
             x_err, y_err, z_err, yaw_err = pose
-            self.gate_detected = True
-            self.gate_name = "GATE_1"
+
+            self.x_err = x_err
+            self.y_err = y_err
+            self.z_err = z_err
             self.theta = yaw_err
             self.theta_valid = True
 
             debug_msg = (
                 f"x={x_err:.1f}cm y={y_err:.1f}cm z={z_err:.1f}cm yaw={yaw_err:.1f}deg"
             )
-            print(f"[🔍 DEBUG] Vision: IDs={valid_ids}, {debug_msg}")
+            self._debug_print(f"[DEBUG] Vision: IDs={valid_ids}, {debug_msg}")
 
             cv2.putText(
                 output,
                 debug_msg,
-                (20, 105),
+                (20, 120),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.60,
                 (255, 255, 255),
+                2,
+            )
+        else:
+            self.theta_valid = False
+            cv2.putText(
+                output,
+                "Pose estimate unavailable",
+                (20, 120),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (0, 165, 255),
                 2,
             )
 
         cv2.putText(
             output,
-            f"Gate center: ({self.u_c:.1f}, {self.v_c:.1f})  A_avg={self.A_avg:.1f}",
-            (20, 130),
+            f"Gate center: ({self.u_c:.1f}, {self.v_c:.1f})",
+            (20, 150),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            (255, 255, 255),
+            2,
+        )
+
+        cv2.putText(
+            output,
+            f"A_avg={self.A_avg:.1f}  corners={self.corners_seen}",
+            (20, 180),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.60,
             (255, 255, 255),
@@ -185,7 +226,7 @@ class VisionProcessor:
         cv2.putText(
             frame,
             f"Valid IDs: {valid_ids}",
-            (20, 60),
+            (20, 65),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (0, 255, 0),
@@ -196,7 +237,7 @@ class VisionProcessor:
             cv2.putText(
                 frame,
                 f"Ignored IDs: {ignored_ids}",
-                (20, 85),
+                (20, 95),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 (0, 0, 255),
@@ -231,7 +272,7 @@ class VisionProcessor:
 
     def _single_marker_pose(self, corner, marker_id, frame):
         if marker_id not in self.marker_positions:
-            print(f"[WARNING] Unknown marker ID in single marker pose: {marker_id}")
+            self._debug_print(f"[WARNING] Unknown marker ID in single marker pose: {marker_id}")
             return None
 
         rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
@@ -261,8 +302,6 @@ class VisionProcessor:
         z_err = float(tvec[2])
         yaw_err = self._yaw_from_rvec(rvec)
 
-        print(f"[🔍 DEBUG] Depth: {z_err:.1f}cm using 1 marker")
-
         return x_err, y_err, z_err, yaw_err
 
     def _multi_marker_pose(self, corners, detected_ids, frame):
@@ -271,7 +310,6 @@ class VisionProcessor:
 
         for marker_corner, marker_id in zip(corners, detected_ids):
             if marker_id not in self.marker_positions:
-                print(f"[WARNING] Skipping unknown marker ID in multi-marker pose: {marker_id}")
                 continue
 
             obj_center = np.array(self.marker_positions[marker_id], dtype=np.float32)
@@ -323,27 +361,7 @@ class VisionProcessor:
         z_err = float(tvec[2][0])
         yaw_err = self._yaw_from_rvec(rvec)
 
-        print(f"[🔍 DEBUG] Depth: {z_err:.1f}cm using {len(detected_ids)} markers")
-
         return x_err, y_err, z_err, yaw_err
-
-    def _predict_missing_markers(self, corners, detected_ids, reference_id):
-        if reference_id not in self.marker_positions:
-            print(f"[WARNING] Unknown reference marker ID: {reference_id}")
-            return {}
-
-        ref_marker_pos = np.array(self.marker_positions[reference_id], dtype=np.float32)
-
-        predicted_positions = {}
-
-        for marker_id, marker_pos in self.marker_positions.items():
-            if marker_id in detected_ids:
-                continue
-
-            marker_pos = np.array(marker_pos, dtype=np.float32)
-            predicted_positions[marker_id] = marker_pos - ref_marker_pos
-
-        return predicted_positions
 
     def _yaw_from_rvec(self, rvec):
         rotation_matrix, _ = cv2.Rodrigues(rvec)
