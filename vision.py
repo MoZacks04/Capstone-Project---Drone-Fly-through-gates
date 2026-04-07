@@ -8,10 +8,10 @@ class VisionProcessor:
         # Marker IDs on the gate:
         # 1 = top left, 2 = top right, 3 = bottom left, 4 = bottom right
         self.marker_positions = {
-            1: (-20.0, 20.0, 0.0),
-            2: (20.0, 20.0, 0.0),
-            3: (-20.0, -20.0, 0.0),
-            4: (20.0, -20.0, 0.0),
+            1: (-40.64, 40.64, 0),
+            2: (40.64, 40.64, 0.0),
+            3: (-40.64, -40.64, 0.0),
+            4: (40.64, -40.64, 0.0),
         }
 
         self.expected_ids = set(self.marker_positions.keys())
@@ -275,18 +275,31 @@ class VisionProcessor:
             self._debug_print(f"[WARNING] Unknown marker ID in single marker pose: {marker_id}")
             return None
 
-        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-            corner,
-            self.marker_size_cm,
-            self.camera_matrix,
-            self.dist_coeffs,
+    # 2D image points from detected marker
+        image_points = corner[0].astype(np.float32)
+
+    # 3D object points for a single square marker centered at origin
+        half = self.marker_size_cm / 2.0
+        object_points = np.array(
+            [
+                [-half,  half, 0.0],   # top-left
+                [ half,  half, 0.0],   # top-right
+                [ half, -half, 0.0],   # bottom-right
+                [-half, -half, 0.0],   # bottom-left
+            ],
+            dtype=np.float32,
         )
 
-        if tvecs is None or len(tvecs) == 0:
-            return None
+        success, rvec, tvec = cv2.solvePnP(
+            object_points,
+            image_points,
+            self.camera_matrix,
+            self.dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
 
-        tvec = tvecs[0][0]
-        rvec = rvecs[0][0]
+        if not success:
+            return None
 
         cv2.drawFrameAxes(
             frame,
@@ -297,9 +310,9 @@ class VisionProcessor:
             self.marker_size_cm * 0.5,
         )
 
-        x_err = float(tvec[0])
-        y_err = float(tvec[1])
-        z_err = float(tvec[2])
+        x_err = float(tvec[0][0])
+        y_err = float(tvec[1][0])
+        z_err = float(tvec[2][0])
         yaw_err = self._yaw_from_rvec(rvec)
 
         return x_err, y_err, z_err, yaw_err
