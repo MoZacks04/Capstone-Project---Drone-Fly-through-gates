@@ -3,25 +3,26 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Set
 
 
-MOVE_STEP_CM = 20
-VERTICAL_STEP_CM = 20
-FORWARD_STEP_CM = 60
-SEARCH_YAW_DEG = 20
+# ---------- RC tuning ----------
+RC_MAX = 35                 # max rc speed command magnitude
+RC_MIN_EFFECTIVE = 12       # minimum useful rc command once outside deadband
+SEARCH_YAW_RC = 20          # yaw command while searching
+FORWARD_RC = 18             # forward speed when centered and committed
 
-MOVE_COOLDOWN_S = 2.0
-VERTICAL_COOLDOWN_S = 3.0
-SEARCH_COOLDOWN_S = 2.5
-FORWARD_COOLDOWN_S = 4.0
-SETTLE_TIME_S = 1.5
-
-STABLE_FRAMES_REQUIRED = 2
-
-# Deadbands: do nothing if error is within these ranges
+# deadbands
 X_DEADBAND_CM = 8.0
 Y_DEADBAND_CM = 12.0
+YAW_DEADBAND_DEG = 8.0
 
-# Ignore absurd pose spikes
+# ignore absurd spikes
 MAX_REASONABLE_Y_ERR_CM = 80.0
+
+# stability logic
+STABLE_FRAMES_REQUIRED = 2
+CENTERED_FRAMES_REQUIRED = 3
+
+# control loop pacing
+COMMAND_PERIOD_S = 0.08     # ~12.5 Hz rc updates
 
 
 @dataclass
@@ -43,26 +44,14 @@ class VisionPacket:
 
 class Controller:
     def __init__(self):
-        self.last_move_time = 0.0
-        self.busy_until = 0.0
         self.state = "SEARCH"
         self.last_corner_pattern: Optional[Set[str]] = None
         self.stable_count = 0
-        self.forward_committed = False
+        self.centered_count = 0
+        self.last_cmd_time = 0.0
 
     def _now(self) -> float:
         return time.time()
-
-    def _is_busy(self) -> bool:
-        return self._now() < self.busy_until
-
-    def _can_move(self, cooldown: float) -> bool:
-        return (self._now() - self.last_move_time) >= cooldown and not self._is_busy()
-
-    def _mark_move(self, cooldown: float):
-        now = self._now()
-        self.last_move_time = now
-        self.busy_until = now + max(cooldown, SETTLE_TIME_S)
 
     def _update_stability(self, corners: Set[str]):
         if corners == self.last_corner_pattern:
@@ -74,118 +63,112 @@ class Controller:
     def _reset_stability(self):
         self.last_corner_pattern = None
         self.stable_count = 0
+        self.centered_count = 0
 
     def _stable_enough(self) -> bool:
         return self.stable_count >= STABLE_FRAMES_REQUIRED
 
-    def _do_command(self, tello, func_name: str, value: int, cooldown: float, note: str = "") -> str:
-        if func_name in {
-            "move_left", "move_right", "move_up", "move_down",
-            "move_forward", "move_back"
-        } and value < 20:
-            value = 20
+    def _rate_limit_ok(self) -> bool:
+        return (self._now() - self.last_cmd_time) >= COMMAND_PERIOD_S
+
+    def _mark_command(self):
+        self.last_cmd_time = self._now()
+
+    def _clamp(self, value: int, lo: int, hi: int) -> int:
+        return max(lo, min(hi, value))
+
+    def _scale_error_to_rc(self, err: float, deadband: float, max_err: float = 40.0) -> int:
+        """
+        Convert error in cm into an RC command.
+        Returns 0 inside deadband.
+        Outside deadband, scales up to RC_MAX.
+        """
+        if abs(err) <= deadband:
+            return 0
+
+        mag = min(abs(err), max_err) / max_err
+        rc = int(RC_MIN_EFFECTIVE + mag * (RC_MAX - RC_MIN_EFFECTIVE))
+        return rc if err > 0 else -rc
+
+    def _send_rc(self, tello, lr: int, fb: int, ud: int, yaw: int) -> str:
+        lr = self._clamp(lr, -100, 100)
+        fb = self._clamp(fb, -100, 100)
+        ud = self._clamp(ud, -100, 100)
+        yaw = self._clamp(yaw, -100, 100)
+
+        if not self._rate_limit_ok():
+            return f"RATE_LIMIT lr={lr} fb={fb} ud={ud} yaw={yaw}"
 
         try:
-            getattr(tello, func_name)(value)
-            self._mark_move(cooldown)
-            msg = f"{func_name}({value})"
-            if note:
-                msg += f" {note}"
-            return msg
+            tello.send_rc_control(lr, fb, ud, yaw)
+            self._mark_command()
+            return f"RC lr={lr} fb={fb} ud={ud} yaw={yaw} state={self.state}"
         except Exception as e:
-            return f"COMMAND_ERROR {func_name}({value}): {e}"
+            return f"COMMAND_ERROR send_rc_control({lr},{fb},{ud},{yaw}): {e}"
+
+    def stop(self, tello) -> str:
+        return self._send_rc(tello, 0, 0, 0, 0)
 
     def update(self, tello, vp: VisionPacket) -> str:
         corners = set(vp.corners_seen or [])
 
-        if self._is_busy():
-            return f"WAIT_SETTLE state={self.state}"
-
-        if self.forward_committed:
-            self.state = "COMMIT_FORWARD"
-            self.forward_committed = False
-            self._reset_stability()
-
-            if not self._can_move(FORWARD_COOLDOWN_S):
-                return "FORWARD_COOLDOWN"
-
-            return self._do_command(
-                tello,
-                "move_forward",
-                FORWARD_STEP_CM,
-                FORWARD_COOLDOWN_S,
-                "[committed after 4-marker lock]"
-            )
-
-        if len(corners) == 0 or vp.N_corners == 0:
+        # -------------------------------------------------
+        # 1) SEARCH MODE: no gate visible -> rotate slowly
+        # -------------------------------------------------
+        if len(corners) == 0 or vp.N_corners == 0 or not vp.gate_detected:
             self.state = "SEARCH"
             self._reset_stability()
+            return self._send_rc(tello, 0, 0, 0, SEARCH_YAW_RC)
 
-            if not self._can_move(SEARCH_COOLDOWN_S):
-                return "SEARCH_COOLDOWN"
-
-            return self._do_command(
-                tello,
-                "rotate_clockwise",
-                SEARCH_YAW_DEG,
-                SEARCH_COOLDOWN_S,
-            )
-
+        # -------------------------------------------------
+        # 2) ALIGN MODE: gate visible -> use x/y errors
+        # -------------------------------------------------
         self.state = "ALIGN"
         self._update_stability(corners)
 
         if not self._stable_enough():
-            return f"WAIT_STABLE corners={sorted(corners)} count={self.stable_count}"
+            return self._send_rc(tello, 0, 0, 0, 0)
 
-        if corners == {"TL", "TR", "BL", "BR"}:
-            self.forward_committed = True
-            return "FORWARD_LOCKED"
+        # Horizontal:
+        # assume:
+        #   x_err > 0  => gate center is to the right  -> move right
+        #   x_err < 0  => gate center is to the left   -> move left
+        lr = self._scale_error_to_rc(vp.x_err, X_DEADBAND_CM)
 
-        # -------- Vertical control from y_err, not corner combos --------
-        if abs(vp.y_err) <= MAX_REASONABLE_Y_ERR_CM and abs(vp.y_err) > Y_DEADBAND_CM:
-            if not self._can_move(VERTICAL_COOLDOWN_S):
-                return f"VERTICAL_COOLDOWN y_err={vp.y_err:.1f}"
+        # Vertical:
+        # based on your earlier code:
+        #   y_err < 0  => move up
+        #   y_err > 0  => move down
+        ud = 0
+        if abs(vp.y_err) <= MAX_REASONABLE_Y_ERR_CM:
+            ud = -self._scale_error_to_rc(vp.y_err, Y_DEADBAND_CM)
+            # negative y_err -> positive ud (up)
+            # positive y_err -> negative ud (down)
 
-            # Tune sign if needed based on your camera convention:
-            # From your logs, negative y_err often corresponded to sending "up".
-            if vp.y_err < -Y_DEADBAND_CM:
-                return self._do_command(
-                    tello, "move_up", VERTICAL_STEP_CM, VERTICAL_COOLDOWN_S,
-                    f"[y_err={vp.y_err:.1f}]"
-                )
+        # Optional yaw alignment
+        yaw = 0
+        if vp.theta_valid and abs(vp.theta) > YAW_DEADBAND_DEG:
+            # tune sign if needed after testing
+            yaw = -self._scale_error_to_rc(vp.theta, YAW_DEADBAND_DEG, max_err=25.0)
 
-            if vp.y_err > Y_DEADBAND_CM:
-                return self._do_command(
-                    tello, "move_down", VERTICAL_STEP_CM, VERTICAL_COOLDOWN_S,
-                    f"[y_err={vp.y_err:.1f}]"
-                )
+        # -------------------------------------------------
+        # 3) FORWARD COMMIT:
+        # only when all 4 corners are visible AND centered
+        # -------------------------------------------------
+        all_four_seen = corners == {"TL", "TR", "BL", "BR"}
+        centered_xy = abs(vp.x_err) <= X_DEADBAND_CM and abs(vp.y_err) <= Y_DEADBAND_CM
+        centered_yaw = (not vp.theta_valid) or (abs(vp.theta) <= YAW_DEADBAND_DEG)
 
-        # -------- Horizontal fallback --------
-        if not self._can_move(MOVE_COOLDOWN_S):
-            return "ALIGN_COOLDOWN"
+        if all_four_seen and centered_xy and centered_yaw:
+            self.centered_count += 1
+        else:
+            self.centered_count = 0
 
-        if corners == {"BR"}:
-            return self._do_command(tello, "move_left", MOVE_STEP_CM, MOVE_COOLDOWN_S)
+        if all_four_seen and self.centered_count >= CENTERED_FRAMES_REQUIRED:
+            self.state = "FORWARD"
+            return self._send_rc(tello, 0, FORWARD_RC, 0, 0)
 
-        if corners == {"BL"}:
-            return self._do_command(tello, "move_right", MOVE_STEP_CM, MOVE_COOLDOWN_S)
-
-        if corners == {"TR"}:
-            return self._do_command(tello, "move_left", MOVE_STEP_CM, MOVE_COOLDOWN_S)
-
-        if corners == {"TL"}:
-            return self._do_command(tello, "move_right", MOVE_STEP_CM, MOVE_COOLDOWN_S)
-
-        if corners == {"TL", "BL"}:
-            return self._do_command(tello, "move_right", MOVE_STEP_CM, MOVE_COOLDOWN_S)
-
-        if corners == {"TR", "BR"}:
-            return self._do_command(tello, "move_left", MOVE_STEP_CM, MOVE_COOLDOWN_S)
-
-        if corners == {"TR", "BL", "BR"}:
-            return self._do_command(tello, "move_left", MOVE_STEP_CM, MOVE_COOLDOWN_S, "[missing TL]")
-
-        if corners == {"TL", "BL", "BR"}:
-            return self._do_command(tello, "move_right", MOVE_STEP_CM, MOVE_COOLDOWN_S, "[missing TR]")
-
-        return f"HOLD y_err={vp.y_err:.1f} corners={sorted(corners)}"
+        # -------------------------------------------------
+        # 4) Otherwise: move toward center using one RC cmd
+        # -------------------------------------------------
+        return self._send_rc(tello, lr, 0, ud, yaw)
