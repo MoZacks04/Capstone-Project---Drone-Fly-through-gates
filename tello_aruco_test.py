@@ -81,10 +81,33 @@ def main():
             if AUTO_MODE and is_flying:
                 try:
                     action = ctrl.update(tello, vp)
+
+                    if "COMMAND_ERROR" in action:
+                        print(f"[AUTO] command failed: {action}")
+                        AUTO_MODE = False
+
+                        try:
+                            if is_flying:
+                                print("[AUTO] attempting emergency land...")
+                                tello.land()
+                        except Exception as land_error:
+                            print(f"[AUTO] landing failed: {land_error}")
+
+                        is_flying = False
+
                 except Exception as e:
                     action = f"CTRL_ERROR: {e}"
                     print(action)
                     AUTO_MODE = False
+
+                    try:
+                        if is_flying:
+                            print("[AUTO] attempting emergency land after controller error...")
+                            tello.land()
+                    except Exception as land_error:
+                        print(f"[AUTO] landing failed: {land_error}")
+
+                    is_flying = False
                 
 
             cv2.putText(

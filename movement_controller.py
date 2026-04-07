@@ -5,23 +5,31 @@ from typing import List, Optional, Set
 
 MOVE_STEP_CM = 20
 VERTICAL_STEP_CM = 20
-FORWARD_STEP_CM = 60
 SEARCH_YAW_DEG = 20
 
 MOVE_COOLDOWN_S = 2.0
 VERTICAL_COOLDOWN_S = 3.0
 SEARCH_COOLDOWN_S = 2.5
-FORWARD_COOLDOWN_S = 4.0
+FORWARD_COOLDOWN_S = 4.5
 SETTLE_TIME_S = 1.5
 
-STABLE_FRAMES_REQUIRED = 2
+STABLE_FRAMES_REQUIRED = 1
 
-# Deadbands: do nothing if error is within these ranges
-X_DEADBAND_CM = 8.0
-Y_DEADBAND_CM = 12.0
+# Deadbands
+X_DEADBAND_CM = 20.0
+Y_DEADBAND_CM = 20.0
 
 # Ignore absurd pose spikes
-MAX_REASONABLE_Y_ERR_CM = 80.0
+MAX_REASONABLE_X_ERR_CM = 50.0
+MAX_REASONABLE_Y_ERR_CM = 50.0
+MAX_REASONABLE_Z_ERR_CM = 400.0
+
+# Dynamic forward distance
+APPROACH_OFFSET_CM = 40
+PASS_THROUGH_MARGIN_CM = 60
+
+MIN_FORWARD_CM = 100
+MAX_FORWARD_CM = 250
 
 
 @dataclass
@@ -49,6 +57,7 @@ class Controller:
         self.last_corner_pattern: Optional[Set[str]] = None
         self.stable_count = 0
         self.forward_committed = False
+        self.locked_forward_cm = MIN_FORWARD_CM
 
     def _now(self) -> float:
         return time.time()
@@ -57,10 +66,10 @@ class Controller:
         return self._now() < self.busy_until
 
     def _can_move(self, cooldown: float) -> bool:
-        return (self._now() - self.last_move_time) >= cooldown and not self._is_busy()
+        return (time.time() - self.last_move_time) >= cooldown and not self._is_busy()
 
     def _mark_move(self, cooldown: float):
-        now = self._now()
+        now = time.time()
         self.last_move_time = now
         self.busy_until = now + max(cooldown, SETTLE_TIME_S)
 
@@ -95,12 +104,21 @@ class Controller:
         except Exception as e:
             return f"COMMAND_ERROR {func_name}({value}): {e}"
 
+    def _compute_forward_distance(self, vp: VisionPacket) -> int:
+        if 0 < vp.z_err <= MAX_REASONABLE_Z_ERR_CM:
+            forward_cm = int(vp.z_err - APPROACH_OFFSET_CM + PASS_THROUGH_MARGIN_CM)
+        else:
+            forward_cm = MAX_FORWARD_CM
+
+        return max(MIN_FORWARD_CM, min(MAX_FORWARD_CM, forward_cm))
+
     def update(self, tello, vp: VisionPacket) -> str:
         corners = set(vp.corners_seen or [])
 
         if self._is_busy():
             return f"WAIT_SETTLE state={self.state}"
 
+        # committed forward pass
         if self.forward_committed:
             self.state = "COMMIT_FORWARD"
             self.forward_committed = False
@@ -112,11 +130,12 @@ class Controller:
             return self._do_command(
                 tello,
                 "move_forward",
-                FORWARD_STEP_CM,
+                self.locked_forward_cm,
                 FORWARD_COOLDOWN_S,
-                "[committed after 4-marker lock]"
+                f"[dynamic pass z={vp.z_err:.1f}]"
             )
 
+        # search
         if len(corners) == 0 or vp.N_corners == 0:
             self.state = "SEARCH"
             self._reset_stability()
@@ -137,44 +156,124 @@ class Controller:
         if not self._stable_enough():
             return f"WAIT_STABLE corners={sorted(corners)} count={self.stable_count}"
 
+        # =================================================
+        # HIGHEST PRIORITY: all 4 markers visible
+        # Do NOT do vertical correction here.
+        # =================================================
         if corners == {"TL", "TR", "BL", "BR"}:
+            # Only allow small horizontal correction if clearly off
+            if abs(vp.x_err) <= MAX_REASONABLE_X_ERR_CM and abs(vp.x_err) > X_DEADBAND_CM:
+                if not self._can_move(MOVE_COOLDOWN_S):
+                    return f"FOUR_MARKER_HORIZONTAL_COOLDOWN x_err={vp.x_err:.1f}"
+
+                # Flip these if left/right direction is wrong on your setup
+                if vp.x_err > X_DEADBAND_CM:
+                    return self._do_command(
+                        tello,
+                        "move_right",
+                        MOVE_STEP_CM,
+                        MOVE_COOLDOWN_S,
+                        f"[4-marker x_err={vp.x_err:.1f}]"
+                    )
+
+                if vp.x_err < -X_DEADBAND_CM:
+                    return self._do_command(
+                        tello,
+                        "move_left",
+                        MOVE_STEP_CM,
+                        MOVE_COOLDOWN_S,
+                        f"[4-marker x_err={vp.x_err:.1f}]"
+                    )
+
+            # If all 4 visible, commit forward directly
+            self.locked_forward_cm = self._compute_forward_distance(vp)
             self.forward_committed = True
-            return "FORWARD_LOCKED"
+            return (
+                f"FOUR_MARKER_LOCKED "
+                f"x={vp.x_err:.1f} y={vp.y_err:.1f} z={vp.z_err:.1f} "
+                f"forward={self.locked_forward_cm}"
+            )
 
-        # -------- Vertical control from y_err, not corner combos --------
-        if abs(vp.y_err) <= MAX_REASONABLE_Y_ERR_CM and abs(vp.y_err) > Y_DEADBAND_CM:
-            if not self._can_move(VERTICAL_COOLDOWN_S):
-                return f"VERTICAL_COOLDOWN y_err={vp.y_err:.1f}"
+        # =================================================
+        # Bottom pair logic
+        # Vertical correction allowed here
+        # =================================================
+        if "BL" in corners and "BR" in corners:
+            # Horizontal correction
+            if abs(vp.x_err) <= MAX_REASONABLE_X_ERR_CM and abs(vp.x_err) > X_DEADBAND_CM:
+                if not self._can_move(MOVE_COOLDOWN_S):
+                    return f"HORIZONTAL_COOLDOWN x_err={vp.x_err:.1f}"
 
-            # Tune sign if needed based on your camera convention:
-            # From your logs, negative y_err often corresponded to sending "up".
-            if vp.y_err < -Y_DEADBAND_CM:
-                return self._do_command(
-                    tello, "move_up", VERTICAL_STEP_CM, VERTICAL_COOLDOWN_S,
-                    f"[y_err={vp.y_err:.1f}]"
-                )
+                if vp.x_err > X_DEADBAND_CM:
+                    return self._do_command(
+                        tello,
+                        "move_right",
+                        MOVE_STEP_CM,
+                        MOVE_COOLDOWN_S,
+                        f"[x_err={vp.x_err:.1f}]"
+                    )
 
-            if vp.y_err > Y_DEADBAND_CM:
-                return self._do_command(
-                    tello, "move_down", VERTICAL_STEP_CM, VERTICAL_COOLDOWN_S,
-                    f"[y_err={vp.y_err:.1f}]"
-                )
+                if vp.x_err < -X_DEADBAND_CM:
+                    return self._do_command(
+                        tello,
+                        "move_left",
+                        MOVE_STEP_CM,
+                        MOVE_COOLDOWN_S,
+                        f"[x_err={vp.x_err:.1f}]"
+                    )
 
-        # -------- Horizontal fallback --------
+            # Vertical correction only for partial view / bottom-pair mode
+            if abs(vp.y_err) <= MAX_REASONABLE_Y_ERR_CM and abs(vp.y_err) > Y_DEADBAND_CM:
+                if not self._can_move(VERTICAL_COOLDOWN_S):
+                    return f"VERTICAL_COOLDOWN y_err={vp.y_err:.1f}"
+
+                if vp.y_err < -Y_DEADBAND_CM:
+                    return self._do_command(
+                        tello,
+                        "move_up",
+                        VERTICAL_STEP_CM,
+                        VERTICAL_COOLDOWN_S,
+                        f"[y_err={vp.y_err:.1f}]"
+                    )
+
+                if vp.y_err > Y_DEADBAND_CM:
+                    return self._do_command(
+                        tello,
+                        "move_down",
+                        VERTICAL_STEP_CM,
+                        VERTICAL_COOLDOWN_S,
+                        f"[y_err={vp.y_err:.1f}]"
+                    )
+
+            self.locked_forward_cm = self._compute_forward_distance(vp)
+            self.forward_committed = True
+            return (
+                f"BOTTOM_PAIR_LOCKED "
+                f"x={vp.x_err:.1f} y={vp.y_err:.1f} z={vp.z_err:.1f} "
+                f"forward={self.locked_forward_cm}"
+            )
+
+        # fallbacks
         if not self._can_move(MOVE_COOLDOWN_S):
             return "ALIGN_COOLDOWN"
 
         if corners == {"BR"}:
-            return self._do_command(tello, "move_left", MOVE_STEP_CM, MOVE_COOLDOWN_S)
+            return self._do_command(
+                tello,
+                "move_left",
+                MOVE_STEP_CM,
+                MOVE_COOLDOWN_S,
+                "[only BR visible]"
+            )
 
         if corners == {"BL"}:
-            return self._do_command(tello, "move_right", MOVE_STEP_CM, MOVE_COOLDOWN_S)
-
-        if corners == {"TR"}:
-            return self._do_command(tello, "move_left", MOVE_STEP_CM, MOVE_COOLDOWN_S)
-
-        if corners == {"TL"}:
-            return self._do_command(tello, "move_right", MOVE_STEP_CM, MOVE_COOLDOWN_S)
+            return self._do_command(
+                tello,
+                "move_right",
+                MOVE_STEP_CM,
+                MOVE_COOLDOWN_S,
+                "[only BL visible]"
+            )
 
         if corners == {"TL", "BL"}:
             return self._do_command(tello, "move_right", MOVE_STEP_CM, MOVE_COOLDOWN_S)
@@ -188,4 +287,4 @@ class Controller:
         if corners == {"TL", "BL", "BR"}:
             return self._do_command(tello, "move_right", MOVE_STEP_CM, MOVE_COOLDOWN_S, "[missing TR]")
 
-        return f"HOLD y_err={vp.y_err:.1f} corners={sorted(corners)}"
+        return f"HOLD x={vp.x_err:.1f} y={vp.y_err:.1f} z={vp.z_err:.1f} corners={sorted(corners)}"

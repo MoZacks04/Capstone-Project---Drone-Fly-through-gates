@@ -8,8 +8,8 @@ class VisionProcessor:
         # Marker IDs on the gate:
         # 1 = top left, 2 = top right, 3 = bottom left, 4 = bottom right
         self.marker_positions = {
-            1: (-40.64, 40.64, 0),
-            2: (40.64, 40.64, 0.0),
+            1: (-40.64, 24.77, 0),
+            2: (40.64, 24.77, 0.0),
             3: (-40.64, -40.64, 0.0),
             4: (40.64, -40.64, 0.0),
         }
